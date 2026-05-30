@@ -1,0 +1,6 @@
+<Solution>
+  <Folder Name="/解决方案项/">
+    <File Path="Room.cs" />
+  </Folder>
+  <Project Path="MainServer.csproj" />
+</Solution>
