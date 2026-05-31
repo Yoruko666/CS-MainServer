@@ -1,5 +1,4 @@
 ﻿using System.Diagnostics;
-using System.Text;
 using Newtonsoft.Json;
 
 namespace MainServer
@@ -7,14 +6,16 @@ namespace MainServer
     public class Room
     {
         public int port;
+        public int id;
         public RoomStatus status;
         public List<int> playerList = [];
 
         private readonly string serverPath = "C:/Users/Yoruko/Desktop/CS/Server/CS_Server.exe";
 
-        public Room(int port)
+        public Room(int port, int id)
         {
             this.port = port;
+            this.id = id;
         }
 
         public void Join(Player player)
@@ -51,10 +52,4 @@ namespace MainServer
 
         }
     }
-    
-    public enum RoomStatus
-    {
-        Waiting, Playing
-    }
-
 }

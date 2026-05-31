@@ -17,21 +17,18 @@ namespace MainServer
 
         private static int roomId = 1;
         private static int nextUid = 1000;
-        private static ConcurrentQueue<Player> queuePractice = new();
-        private static ConcurrentQueue<Player> queue1V1 = new();
-        private static ConcurrentQueue<Player> queue5V5 = new();
         private static ConcurrentDictionary<int, Room> roomList = [];
-        private static Dictionary<GameMode, ConcurrentQueue<Player>> queueDic = [];
-        private static Dictionary<GameMode, int> numDic = [];
+        private static Dictionary<GameMode, QueueInfo> queues = new()
+        {
+            [GameMode.ModePractice] = new(1),
+            [GameMode.Mode1v1] = new(2),
+            [GameMode.Mode3v3] = new(6),
+        };
+        private static Dictionary<HallMessageType, Action<HallMessage>> messageHandlers = [];
 
         static void Main()
         {
-            queueDic.Add(GameMode.ModePractice, queuePractice);
-            queueDic.Add(GameMode.Mode1v1, queue1V1);
-            queueDic.Add(GameMode.Mode5v5, queue5V5);
-            numDic.Add(GameMode.ModePractice, 1);
-            numDic.Add(GameMode.Mode1v1, 2);
-            numDic.Add(GameMode.Mode5v5, 10);
+            RegisterHandlers();
 
             Thread startServer = new(StartServer);
             startServer.Start();
@@ -45,14 +42,8 @@ namespace MainServer
                 {
                     try
                     {
-                        switch (msg.type)
-                        {
-                            case HallMessageType.Match:
-                                Match? match = JsonConvert.DeserializeObject<Match>(msg.info);
-                                if (match != null && match.uid > 0 && players.TryGetValue(match.uid, out Player? player))
-                                    queueDic[match.mode].Enqueue(player);
-                                break;
-                        }
+                        if (messageHandlers.TryGetValue(msg.type, out var handler))
+                            handler(msg);
                     }
                     catch (Exception ex)
                     {
@@ -60,6 +51,19 @@ namespace MainServer
                     }
                 }
             }
+        }
+
+        static void RegisterHandlers()
+        {
+            messageHandlers[HallMessageType.Match] = msg =>
+            {
+                Match? match = JsonConvert.DeserializeObject<Match>(msg.info!);
+                if (match != null && match.uid > 0 && players.TryGetValue(match.uid, out Player? player))
+                {
+                    Console.WriteLine($"Player {match.uid} match {match.mode}");
+                    queues[match.mode].Players.Enqueue(player);
+                }
+            };
         }
 
         static void StartServer()
@@ -81,7 +85,7 @@ namespace MainServer
                 listen.Start(uid);
 
                 Connect connect = new(uid);
-                SendMessage(client, new HallMessage(HallMessageType.Connect, JsonConvert.SerializeObject(connect)));
+                Send(client, new HallMessage(HallMessageType.Connect, JsonConvert.SerializeObject(connect)));
             }
         }
 
@@ -103,20 +107,11 @@ namespace MainServer
                     }
                     buffer.Append(Encoding.UTF8.GetString(data, 0, len));
 
-                    string allData = buffer.ToString();
-                    int closeBrace;
-                    while ((closeBrace = allData.IndexOf('}')) >= 0)
+                    foreach (string json in ExtractJsonObjects(buffer))
                     {
-                        string json = allData[..(closeBrace + 1)];
-                        allData = allData[(closeBrace + 1)..];
-                        buffer.Clear();
-                        buffer.Append(allData);
-
                         HallMessage? msg = JsonConvert.DeserializeObject<HallMessage>(json);
                         if (msg != null && !string.IsNullOrEmpty(msg.info))
-                        {
                             messageList.Enqueue(msg);
-                        }
                     }
                 }
                 catch (JsonException)
@@ -132,7 +127,58 @@ namespace MainServer
             }
         }
 
-        public static void SendMessage(Socket socket, HallMessage message)
+        /// <summary>
+        /// 从缓冲区中提取完整 JSON 对象（按 {} 深度匹配，正确处理字符串内的 {}）
+        /// </summary>
+        static List<string> ExtractJsonObjects(StringBuilder buffer)
+        {
+            string data = buffer.ToString();
+            int pos = 0;
+            var results = new List<string>();
+
+            while (pos < data.Length)
+            {
+                while (pos < data.Length && char.IsWhiteSpace(data[pos])) pos++;
+                if (pos >= data.Length) break;
+                if (data[pos] != '{') { pos++; continue; }
+
+                int depth = 1;
+                bool inString = false;
+                bool escaped = false;
+                int start = pos;
+                pos++;
+
+                while (pos < data.Length && depth > 0)
+                {
+                    char c = data[pos];
+                    if (escaped) escaped = false;
+                    else if (c == '\\') escaped = true;
+                    else if (c == '"') inString = !inString;
+                    else if (!inString)
+                    {
+                        if (c == '{') depth++;
+                        else if (c == '}') depth--;
+                    }
+                    pos++;
+                }
+
+                if (depth == 0)
+                {
+                    results.Add(data[start..pos]);
+                    buffer.Remove(0, pos);
+                    data = buffer.ToString();
+                    pos = 0;
+                }
+                else
+                {
+                    break;
+                }
+            }
+
+            return results;
+        }
+
+        public static bool Send(Socket socket, HallMessage message)
         {
             try
             {
@@ -140,10 +186,12 @@ namespace MainServer
                 int sent = 0;
                 while (sent < buffer.Length)
                     sent += socket.Send(buffer, sent, buffer.Length - sent, SocketFlags.None);
+                return true;
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"Send error: {ex.Message}");
+                return false;
             }
         }
 
@@ -154,16 +202,25 @@ namespace MainServer
                 player.socket.Shutdown(SocketShutdown.Both);
                 player.socket.Close();
 
-                foreach (var queue in queueDic.Values)
+                // 从匹配队列中移除
+                foreach (var qi in queues.Values)
                 {
+                    var q = qi.Players;
                     var remaining = new ConcurrentQueue<Player>();
-                    while (queue.TryDequeue(out Player? p))
+                    while (q.TryDequeue(out Player? p))
                     {
                         if (p!.uid != uid)
                             remaining.Enqueue(p);
                     }
                     while (remaining.TryDequeue(out Player? p))
-                        queue.Enqueue(p!);
+                        q.Enqueue(p!);
+                }
+
+                // 如果在房间内，空出位置
+                if (player.roomId > 0 && roomList.TryGetValue(player.roomId, out Room? room))
+                {
+                    room.Remove(player);
+                    Console.WriteLine($"Player {uid} removed from room {player.roomId}, remaining: {room.playerList.Count}");
                 }
 
                 Console.WriteLine($"A player was disconnected, uid: {uid}");
@@ -175,8 +232,8 @@ namespace MainServer
             while (true)
             {
                 bool matched = false;
-                foreach (GameMode mode in queueDic.Keys)
-                    if (queueDic[mode].Count >= numDic[mode])
+                foreach (GameMode mode in queues.Keys)
+                    if (queues[mode].Players.Count >= queues[mode].Required)
                     {
                         StartRoom(mode);
                         matched = true;
@@ -188,95 +245,33 @@ namespace MainServer
 
         private static void StartRoom(GameMode mode)
         {
-            Room room = CreateRoom();
-            for (int i = 0; i < numDic[mode]; i++)
+            var (room, rid) = CreateRoom();
+            for (int i = 0; i < queues[mode].Required; i++)
             {
-                if (queueDic[mode].TryDequeue(out Player? player))
+                if (queues[mode].Players.TryDequeue(out Player? player))
                 {
-                    room.Join(player);
                     var start = new Start(room.port, 0);
-                    SendMessage(player.socket, new HallMessage(HallMessageType.Start, JsonConvert.SerializeObject(start)));
+                    if (Send(player.socket, new HallMessage(HallMessageType.Start, JsonConvert.SerializeObject(start))))
+                    {
+                        player!.roomId = rid;
+                        room.Join(player);
+                    }
+                    else
+                    {
+                        HandleDisconnect(player!.uid);
+                    }
                 }
             }
-            room.StartRoom();
+            if (room.playerList.Count > 0)
+                room.StartRoom();
         }
 
-        static Room CreateRoom()
+        static (Room, int) CreateRoom()
         {
             int rid = Interlocked.Increment(ref roomId);
-            Room room = new(port + rid);
+            Room room = new(port + rid, rid);
             roomList.TryAdd(rid, room);
-            return room;
+            return (room, rid);
         }
     }
-
-    public enum GameMode
-    {
-        ModePractice, Mode1v1, Mode5v5
-    }
-
-    public enum HallMessageType
-    {
-        Connect, Match, Start
-    }
-
-    /// <summary>
-    /// 消息包装类，与客户端保持一致
-    /// </summary>
-    public class HallMessage
-    {
-        public HallMessageType type;
-        public string info;
-
-        public HallMessage(HallMessageType type, string info)
-        {
-            this.type = type;
-            this.info = info;
-        }
-    }
-
-    public class Connect
-    {
-        public int uid;
-        public Connect() { }
-        public Connect(int uid)
-        {
-            this.uid = uid;
-        }
-    }
-
-    public class Match
-    {
-        public int uid;
-        public GameMode mode;
-        public Match() { }
-        public Match(int uid, GameMode mode)
-        {
-            this.uid = uid;
-            this.mode = mode;
-        }
-    }
-
-    public class Start
-    {
-        public int port;
-        public int map;
-        public Start(int port, int map)
-        {
-            this.port = port;
-            this.map = map;
-        }
-    }
-
-    public class Player
-    {
-        public int uid;
-        public Socket socket;
-        public Player(int uid, Socket socket)
-        {
-            this.uid = uid;
-            this.socket = socket;
-        }
-    }
-
 }
